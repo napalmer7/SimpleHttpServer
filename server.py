@@ -4,20 +4,19 @@ from cgi import parse_header
 import logging
 import traceback
 import json
+from simple_datastore import SimpleDatastore
 
 logging.basicConfig(level=logging.INFO,
                     format="%(created)-15s %(msecs)d %(levelname)8s %(thread)d %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+data_store = None
 HOST = ''
 PORT = 4000
 
 SET_OP = "set"
 COMMIT_OP = "commit"
-
-# TODO - Build backend datastore (must handle reboots/service shutdown)
-# TODO - Build pending cache layer (may require a class wrapper to indicate if update or not)
 
 
 class simpleRequestHandler(BaseHTTPRequestHandler):
@@ -71,20 +70,21 @@ class simpleRequestHandler(BaseHTTPRequestHandler):
 
         If the key does not exist the response code will be 404.
         """
+        global data_store
         logger.info("Received a GET request: {}".format(self.path))
         response_code = 404
+        response = None
         if(self.path.count('/') == 1):
             path = self.strip_path()
             if not (path == SET_OP or path == COMMIT_OP):
-                response_code = 200
+                value = data_store.get_data(path)
+                if value:
+                    response = {path: value}
+                    response_code = 200
 
+        if response:
+            self.wfile.write(self.str_to_bytes(json.dumps(response)))
         self.send_response(response_code)
-        """
-        If Key is in cache
-            self.send_response(200)
-        else
-            self.send_response(404)
-        """
 
     def process_set_request(self):
         """
@@ -92,21 +92,22 @@ class simpleRequestHandler(BaseHTTPRequestHandler):
 
         :returns: int (204)
         """
+        global data_store
         response_code = 404
         try:
             data = self.parse_data()
             logger.info("Data received {}: {}".format(type(data), data))
-            """
-            If Key is not in cache
-              response_code = 201
-              add to pending
-            else
-              response_code = 200
-              Check if more than 1 update op pending
+
+            if len(data.keys()) > 1:
                 response_code = 400
-              else
-                add to pending
-            """
+            else:
+                for k, v in data.items():
+                    update = data_store.add_pending_item(k, v)
+                    if update:
+                        response_code = 200
+                    else:
+                        response_code = 201
+                self.wfile.write(self.str_to_bytes(json.dumps(data)))
         except Exception as ex:
             logger.error("Unable to process set request. {}:{}".format(type(ex),
                                                                        ex))
@@ -118,7 +119,8 @@ class simpleRequestHandler(BaseHTTPRequestHandler):
 
         :returns: int (204)
         """
-        # z = {**test, **test2} will merge two dictionaries based on key py3.5+
+        global data_store
+        data_store.commit_changes()
         return 204
 
     def do_POST(self):
@@ -139,19 +141,24 @@ class simpleRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         """Uses the specified key data to indicate a pending delete operation."""
+        global data_store
         logger.info("Received a DELETE request: {}".format(self.path))
         data = self.parse_data()
         # Data should be the key name
         logger.info("Data received {}: {}".format(type(data), data))
         path = self.strip_path()
         if path == SET_OP:
-            self.send_response(self.process_delete_request())
+            logger.info("Running delete")
+            data_store.delete_data(data)
+            response_code = 200
         else:
             logger.error("Invalid DELETE operation {} was received.".format(path))
-            self.send_response(404)
+            response_code = 404
+        self.send_response(response_code)
 
 
 if __name__ == "__main__":
+    data_store = SimpleDatastore()
     server = None
     try:
         server = HTTPServer((HOST, PORT), simpleRequestHandler)
@@ -170,3 +177,5 @@ if __name__ == "__main__":
         logger.error(traceback.format_exc())
         logger.error("Unexpected error running the service. {}: {}".format(type(ex),
                                                                            ex))
+    finally:
+        data_store.close()
